@@ -51,6 +51,14 @@ const path = require('path');
 const https = require('https');
 const skills = require('./skills');
 
+const { SystemQmdDriver, SystemNativeDriver, BrowserMemoryDriver } = require('./brains/utils/MemoryDrivers');
+const { DOMDoctor, KeyChain } = require('./brains/utils/DOMDoctor');
+const ResponseParser = require('./brains/utils/ResponseParser');
+const BrainManager = require('./brains/BrainManager');
+const WebGeminiBrain = require('./brains/WebGeminiBrain');
+const WebChatGPTBrain = require('./brains/WebChatGPTBrain');
+const OllamaBrain = require('./brains/OllamaBrain');
+
 // --- ⚙️ 全域配置 ---
 const cleanEnv = (str, allowSpaces = false) => {
     if (!str) return "";
@@ -74,6 +82,10 @@ const CONFIG = {
     ADMIN_IDS: [process.env.ADMIN_ID, process.env.DISCORD_ADMIN_ID].map(k => cleanEnv(k)).filter(k => k),
     GITHUB_REPO: cleanEnv(process.env.GITHUB_REPO || 'https://raw.githubusercontent.com/Arvincreator/project-golem/main/', true),
     QMD_PATH: cleanEnv(process.env.GOLEM_QMD_PATH || 'qmd', true),
+    BRAIN_SEQUENCE: (process.env.BRAIN_SEQUENCE || 'gemini-web,chatgpt-web,ollama').split(','),
+    HEADLESS: (process.env.GOLEM_HEADLESS || "new") === "new",
+    OLLAMA_BASE_URL: process.env.OLLAMA_BASE_URL,
+    OLLAMA_MODEL: process.env.OLLAMA_MODEL,
     DONATE_URL: 'https://buymeacoffee.com/arvincreator'
 };
 
@@ -83,7 +95,8 @@ if (isPlaceholder(CONFIG.DC_TOKEN)) { console.warn("⚠️ [Config] DISCORD_TOKE
 if (CONFIG.API_KEYS.some(isPlaceholder)) CONFIG.API_KEYS = CONFIG.API_KEYS.filter(k => !isPlaceholder(k));
 
 // --- 初始化組件 ---
-puppeteer.use(StealthPlugin());
+// puppeteer.use(StealthPlugin()); // Moved to Brains
+
 
 const tgBot = CONFIG.TG_TOKEN ? new TelegramBot(CONFIG.TG_TOKEN, { polling: true }) : null;
 const dcClient = CONFIG.DC_TOKEN ? new Client({
@@ -465,559 +478,27 @@ ${CONFIG.DONATE_URL}
 // ============================================================
 // 🗝️ KeyChain & 🚑 DOM Doctor (已修復 AI 廢話導致崩潰問題)
 // ============================================================
-class KeyChain {
-    constructor() {
-        this.keys = CONFIG.API_KEYS;
-        this.currentIndex = 0;
-        console.log(`🗝️ [KeyChain] 已載入 ${this.keys.length} 把 API Key。`);
-    }
-    getKey() {
-        if (this.keys.length === 0) return null;
-        const key = this.keys[this.currentIndex];
-        this.currentIndex = (this.currentIndex + 1) % this.keys.length;
-        return key;
-    }
-}
+// KeyChain & DOMDoctor moved to brains/utils
 
-class DOMDoctor {
-    constructor() {
-        this.keyChain = new KeyChain();
-        this.cacheFile = path.join(process.cwd(), 'golem_selectors.json');
-        this.defaults = {
-            input: 'div[contenteditable="true"], rich-textarea > div, p[data-placeholder]',
-            send: 'button[aria-label*="Send"], button[aria-label*="傳送"], span[data-icon="send"]',
-            response: '.model-response-text, .message-content, .markdown, div[data-test-id="message-content"]'
-        };
-    }
-    loadSelectors() {
-        try {
-            if (fs.existsSync(this.cacheFile)) {
-                const cached = JSON.parse(fs.readFileSync(this.cacheFile, 'utf-8'));
-                return { ...this.defaults, ...cached };
-            }
-        } catch (e) { }
-        return { ...this.defaults };
-    }
-    saveSelectors(newSelectors) {
-        try {
-            const current = this.loadSelectors();
-            const updated = { ...current, ...newSelectors };
-            fs.writeFileSync(this.cacheFile, JSON.stringify(updated, null, 2));
-            console.log("💾 [Doctor] Selector 已更新並存檔！");
-        } catch (e) { }
-    }
-    async diagnose(htmlSnippet, targetType) {
-        if (this.keyChain.keys.length === 0) return null;
-
-        // 策略 1: 優化提示詞，教 AI 像人類一樣「往上找容器」
-        const hints = {
-            'input': '目標是輸入框。⚠️ 注意：請忽略內層的 <p>, <span> 或 text node。請往上尋找最近的一個「容器 div」，它通常具備 contenteditable="true"、role="textbox" 或 class="ql-editor" 屬性。',
-            'send': '目標是發送按鈕。⚠️ 注意：請找出外層的 <button> 或具備互動功能的 <mat-icon>，不要只選取裡面的 <svg> 或 <path>。特徵：aria-label="Send" 或 data-mat-icon-name="send"。',
-            'response': '找尋 AI 回覆的文字氣泡。'
-        };
-
-        const targetDescription = hints[targetType] || targetType;
-        console.log(`🚑 [Doctor] 啟動深層診斷: 目標 [${targetType}]...`);
-
-        // 策略 2: 頭尾夾擊法 (Head + Tail Strategy)
-        // 確保能抓到位於頁面最底部的輸入框與按鈕，同時保留頭部樣式資訊
-        let safeHtml = htmlSnippet;
-        if (htmlSnippet.length > 60000) {
-            const head = htmlSnippet.substring(0, 5000);
-            // 取最後 55,000 字，因為輸入框通常在 DOM 結構的最下方
-            const tail = htmlSnippet.substring(htmlSnippet.length - 55000);
-            safeHtml = `${head}\n\n\n\n${tail}`;
-        }
-
-        const prompt = `你是 Puppeteer 自動化專家。目前的 CSS Selector 失效。
-    請分析 HTML，找出目標: "${targetType}" (${targetDescription}) 的最佳 CSS Selector。
-
-    HTML 片段:
-    \`\`\`html
-    ${safeHtml}
-    \`\`\`
-
-    規則：
-    1. 只回傳 JSON: {"selector": "your_css_selector"}
-    2. 選擇器必須具備高特異性 (Specificity)，但不要依賴隨機生成的 ID (如 #xc-123)。
-    3. 優先使用 id, name, role, aria-label, data-attribute。`;
-
-        let attempts = 0;
-        while (attempts < this.keyChain.keys.length) {
-            try {
-                const genAI = new GoogleGenerativeAI(this.keyChain.getKey());
-                const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-                const result = await model.generateContent(prompt);
-                const rawText = result.response.text().trim();
-
-                let selector = "";
-                try {
-                    const jsonStr = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
-                    const parsed = JSON.parse(jsonStr);
-                    selector = parsed.selector;
-                } catch (jsonErr) {
-                    console.warn(`⚠️ [Doctor] JSON 解析失敗，嘗試暴力提取 (Raw: ${rawText.substring(0, 50)}...)`);
-                    const lines = rawText.split('\n').filter(l => l.trim().length > 0);
-                    const lastLine = lines[lines.length - 1].trim();
-                    if (!lastLine.includes(' ')) selector = lastLine;
-                }
-
-                if (selector && selector.length > 0 && selector.length < 150 && !selector.includes('問題')) {
-                    console.log(`✅ [Doctor] 診斷成功，新 Selector: ${selector}`);
-                    return selector;
-                } else {
-                    console.warn(`⚠️ [Doctor] AI 提供的 Selector 無效或包含雜訊: ${selector}`);
-                }
-            } catch (e) {
-                console.error(`❌ [Doctor] 診斷 API 錯誤: ${e.message}`);
-                attempts++;
-            }
-        }
-        return null;
-    }
-}
 
 // ============================================================
 // 🧠 Memory Drivers (雙模記憶驅動 + 排程擴充)
 // ============================================================
-class BrowserMemoryDriver {
-    constructor(brain) { this.brain = brain; }
-    async init() {
-        if (this.brain.memoryPage) return;
-        try {
-            this.brain.memoryPage = await this.brain.browser.newPage();
-            const memoryPath = 'file:///' + path.join(process.cwd(), 'memory.html').replace(/\\/g, '/');
-            console.log(`🧠 [Memory:Browser] 正在掛載神經海馬迴: ${memoryPath}`);
-            await this.brain.memoryPage.goto(memoryPath);
-            await new Promise(r => setTimeout(r, 5000));
-        } catch (e) { console.error("❌ [Memory:Browser] 啟動失敗:", e.message); }
-    }
-    async recall(query) {
-        if (!this.brain.memoryPage) return [];
-        return await this.brain.memoryPage.evaluate(async (txt) => {
-            return window.queryMemory ? await window.queryMemory(txt) : [];
-        }, query);
-    }
-    async memorize(text, metadata) {
-        if (!this.brain.memoryPage) return;
-        await this.brain.memoryPage.evaluate(async (t, m) => {
-            if (window.addMemory) await window.addMemory(t, m);
-        }, text, metadata);
-    }
+// Orphans removed
 
-    // ✨ [Chronos Update] 排程接口
-    async addSchedule(task, time) {
-        if (!this.brain.memoryPage) return;
-        await this.brain.memoryPage.evaluate(async (t, time) => {
-            if (window.addSchedule) await window.addSchedule(t, time);
-        }, task, time);
-    }
-    async checkDueTasks() {
-        if (!this.brain.memoryPage) return [];
-        return await this.brain.memoryPage.evaluate(async () => {
-            return window.checkSchedule ? await window.checkSchedule() : [];
-        });
-    }
-}
-
-class SystemQmdDriver {
-    constructor() {
-        this.baseDir = path.join(process.cwd(), 'golem_memory', 'knowledge');
-        if (!fs.existsSync(this.baseDir)) fs.mkdirSync(this.baseDir, { recursive: true });
-        this.qmdCmd = 'qmd';
-    }
-    async init() {
-        console.log("🔍 [Memory:Qmd] 啟動引擎探測...");
-        try {
-            const checkCmd = (c) => {
-                try {
-                    const findCmd = os.platform() === 'win32' ? `where ${c}` : `command -v ${c}`;
-                    execSync(findCmd, { stdio: 'ignore', env: process.env });
-                    return true;
-                } catch (e) { return false; }
-            };
-            if (CONFIG.QMD_PATH !== 'qmd' && fs.existsSync(CONFIG.QMD_PATH)) this.qmdCmd = `"${CONFIG.QMD_PATH}"`;
-            else if (checkCmd('qmd')) this.qmdCmd = 'qmd';
-            else {
-                const homeQmd = path.join(os.homedir(), '.bun', 'bin', 'qmd');
-                if (fs.existsSync(homeQmd)) this.qmdCmd = `"${homeQmd}"`;
-                else if (os.platform() !== 'win32') {
-                    try {
-                        const bashFound = execSync('bash -lc "which qmd"', { encoding: 'utf8', env: process.env }).trim();
-                        if (bashFound) this.qmdCmd = `"${bashFound}"`;
-                        else throw new Error();
-                    } catch (e) { throw new Error("QMD_NOT_FOUND"); }
-                } else throw new Error("QMD_NOT_FOUND");
-            }
-            console.log(`🧠 [Memory:Qmd] 引擎連線成功: ${this.qmdCmd}`);
-            try {
-                execSync(`${this.qmdCmd} collection add "${path.join(this.baseDir, '*.md')}" --name golem-core`, { stdio: 'ignore', env: process.env, shell: true });
-            } catch (e) { }
-        } catch (e) {
-            console.error(`❌ [Memory:Qmd] 找不到 qmd。`);
-            throw new Error("QMD_MISSING");
-        }
-    }
-    async recall(query) {
-        return new Promise((resolve) => {
-            const safeQuery = query.replace(/"/g, '\\"');
-            const cmd = `${this.qmdCmd} search golem-core "${safeQuery}" --hybrid --limit 3`;
-            exec(cmd, (err, stdout) => {
-                if (err) { resolve([]); return; }
-                const result = stdout.trim();
-                if (result) resolve([{ text: result, score: 0.95, metadata: { source: 'qmd' } }]);
-                else resolve([]);
-            });
-        });
-    }
-    async memorize(text, metadata) {
-        const filename = `mem_${Date.now()}.md`;
-        const filepath = path.join(this.baseDir, filename);
-        fs.writeFileSync(filepath, `---\ndate: ${new Date().toISOString()}\ntype: ${metadata.type || 'general'}\n---\n${text}`, 'utf8');
-        exec(`${this.qmdCmd} embed golem-core "${filepath}"`, (err) => { if (err) console.error("⚠️ [Memory:Qmd] 索引失敗"); });
-    }
-    // QMD 暫不支援排程，僅作空實作
-    async addSchedule(task, time) { console.warn("⚠️ QMD 模式不支援排程"); }
-    async checkDueTasks() { return []; }
-}
-
-class SystemNativeDriver {
-    constructor() {
-        this.baseDir = path.join(process.cwd(), 'golem_memory', 'knowledge');
-        if (!fs.existsSync(this.baseDir)) fs.mkdirSync(this.baseDir, { recursive: true });
-    }
-    async init() { console.log("🧠 [Memory:Native] 系統原生核心已啟動"); }
-    async recall(query) {
-        try {
-            const files = fs.readdirSync(this.baseDir).filter(f => f.endsWith('.md'));
-            const results = [];
-            for (const file of files) {
-                const content = fs.readFileSync(path.join(this.baseDir, file), 'utf8');
-                const keywords = query.toLowerCase().split(/\s+/);
-                let score = 0;
-                keywords.forEach(k => { if (content.toLowerCase().includes(k)) score += 1; });
-                if (score > 0) results.push({ text: content.replace(/---[\s\S]*?---/, '').trim(), score: score / keywords.length, metadata: { source: file } });
-            }
-            return results.sort((a, b) => b.score - a.score).slice(0, 3);
-        } catch (e) { return []; }
-    }
-    async memorize(text, metadata) {
-        const filename = `mem_${Date.now()}.md`;
-        const filepath = path.join(this.baseDir, filename);
-        fs.writeFileSync(filepath, `---\ndate: ${new Date().toISOString()}\ntype: ${metadata.type || 'general'}\n---\n${text}`, 'utf8');
-    }
-    // Native 暫不支援排程
-    async addSchedule(task, time) { console.warn("⚠️ Native 模式不支援排程"); }
-    async checkDueTasks() { return []; }
-}
+// MemoryDrivers moved to brains/utils
 
 // ============================================================
 // 🧠 Golem Brain (Web Gemini) - Dual-Engine + Titan Protocol
 // ============================================================
-function getSystemFingerprint() { return `OS: ${os.platform()} | Arch: ${os.arch()} | Mode: ${cleanEnv(process.env.GOLEM_MEMORY_MODE || 'browser')}`; }
+// GolemBrain replaced by BrainManager
 
-class GolemBrain {
-    constructor() {
-        this.browser = null;
-        this.page = null;
-        this.memoryPage = null;
-        this.doctor = new DOMDoctor();
-        this.selectors = this.doctor.loadSelectors();
-        this.cdpSession = null;
-
-        const mode = cleanEnv(process.env.GOLEM_MEMORY_MODE || 'browser').toLowerCase();
-        console.log(`⚙️ [System] 記憶引擎模式: ${mode.toUpperCase()}`);
-        if (mode === 'qmd') this.memoryDriver = new SystemQmdDriver();
-        else if (mode === 'native' || mode === 'system') this.memoryDriver = new SystemNativeDriver();
-        else this.memoryDriver = new BrowserMemoryDriver(this);
-    }
-
-    async init(forceReload = false) {
-        if (this.browser && !forceReload) return;
-        let isNewSession = false;
-
-        if (!this.browser) {
-            this.browser = await puppeteer.launch({
-                headless: "new", // ✨ [User Request] Set to new headless mode (background)
-                userDataDir: CONFIG.USER_DATA_DIR,
-                args: ['--no-sandbox', '--window-size=1280,900']
-            });
-        }
-        if (!this.page) {
-            const pages = await this.browser.pages();
-            this.page = pages.length > 0 ? pages[0] : await this.browser.newPage();
-            await this.page.goto('https://gemini.google.com/app', { waitUntil: 'networkidle2' });
-            isNewSession = true;
-        }
-        try { await this.memoryDriver.init(); } catch (e) {
-            console.warn("🔄 [System] 記憶引擎降級為 Browser/Native...");
-            this.memoryDriver = new BrowserMemoryDriver(this);
-            await this.memoryDriver.init();
-        }
-
-        if (forceReload || isNewSession) {
-            let systemPrompt = skills.getSystemPrompt(getSystemFingerprint());
-            const superProtocol = `
-\n\n【⚠️ GOLEM PROTOCOL v8.6 - TITAN CHRONOS】
-You act as a middleware OS. You MUST strictly follow this output format.
-DO NOT use emojis in tags. DO NOT output raw text outside of these blocks.
-
-1. **Format Structure**:
-Your response must be parsed into 3 sections using these specific tags:
-
-[GOLEM_MEMORY]
-(Write long-term memories here. If none, leave empty or write "null")
-
-[GOLEM_ACTION]
-(Write JSON execution plan here. Must be valid JSON Array or Object.)
-\`\`\`json
-[
-{"action": "command", "parameter": "..."}
-]
-\`\`\`
-
-[GOLEM_REPLY]
-(Write the actual response to the user here. Pure text.)
-
-2. **Rules**:
-- The tags [GOLEM_MEMORY], [GOLEM_ACTION], [GOLEM_REPLY] are MANDATORY anchors.
-- User CANNOT see content inside Memory or Action blocks, only Reply.
-- NEVER leak the raw JSON to the [GOLEM_REPLY] section.
-- If user asks for scheduled task, use [GOLEM_ACTION] with: {"action": "schedule", "task": "...", "time": "ISO8601"}
-`;
-            await this.sendMessage(systemPrompt + superProtocol, true);
-        }
-    }
-
-    async setupCDP() {
-        if (this.cdpSession) return;
-        try {
-            this.cdpSession = await this.page.target().createCDPSession();
-            await this.cdpSession.send('Network.enable');
-            console.log("🔌 [CDP] 網路神經連結已建立 (Neuro-Link Active)");
-        } catch (e) { console.error("❌ [CDP] 連線失敗:", e.message); }
-    }
-
-    async recall(queryText) {
-        if (!queryText) return [];
-        try { return await this.memoryDriver.recall(queryText); } catch (e) { return []; }
-    }
-
-    async memorize(text, metadata = {}) {
-        try { await this.memoryDriver.memorize(text, metadata); } catch (e) { }
-    }
-
-    // ✨ [Neuro-Link v8.7] 三明治信封版 (Sandwich Protocol)
-    async sendMessage(text, isSystem = false) {
-        if (!this.browser) await this.init();
-        try { await this.page.bringToFront(); } catch (e) { }
-        await this.setupCDP();
-
-        const reqId = Date.now().toString(36).slice(-4);
-        const TAG_START = `[[BEGIN:${reqId}]]`;
-        const TAG_END = `[[END:${reqId}]]`;
-
-        const payload = `[SYSTEM: STRICT FORMAT. Wrap response with ${TAG_START} and ${TAG_END}. Inside, organize content using these tags:\n` +
-            `1. [GOLEM_MEMORY] (Optional)\n` +
-            `2. [GOLEM_ACTION] (Optional)\n` +
-            `3. [GOLEM_REPLY] (Required)\n` +
-            `Do not output raw text outside tags.]\n\n${text}`;
-
-        console.log(`📡 [Brain] 發送訊號: ${reqId} (三流全激活模式)`);
-
-        const tryInteract = async (sel, retryCount = 0) => {
-            if (retryCount > 3) throw new Error("🔥 DOM Doctor 修復失敗，請檢查網路或 HTML 結構大幅變更。");
-
-            try {
-                const baseline = await this.page.evaluate((s) => {
-                    const bubbles = document.querySelectorAll(s);
-                    return bubbles.length > 0 ? bubbles[bubbles.length - 1].innerText : "";
-                }, sel.response);
-
-                // --- 1. 檢查輸入框 (Input) ---
-                let inputEl = await this.page.$(sel.input);
-                if (!inputEl) {
-                    console.log("🚑 找不到輸入框，呼叫 DOM Doctor...");
-                    const html = await this.page.content();
-                    const newSel = await this.doctor.diagnose(html, 'input');
-                    if (newSel) {
-                        this.selectors.input = newSel;
-                        this.doctor.saveSelectors(this.selectors);
-                        return tryInteract(this.selectors, retryCount + 1);
-                    }
-                    throw new Error(`無法修復輸入框 Selector`);
-                }
-
-                // --- 2. 執行輸入 ---
-                await this.page.evaluate((s, t) => {
-                    const el = document.querySelector(s);
-                    el.focus();
-                    document.execCommand('insertText', false, t);
-                }, sel.input, payload);
-
-                await new Promise(r => setTimeout(r, 800));
-
-                // --- 3. 檢查發送按鈕 (Send) ---
-                let sendEl = await this.page.$(sel.send);
-                if (!sendEl) {
-                    console.log("🚑 找不到發送按鈕，呼叫 DOM Doctor...");
-                    const html = await this.page.content();
-                    const newSel = await this.doctor.diagnose(html, 'send');
-                    if (newSel) {
-                        this.selectors.send = newSel;
-                        this.doctor.saveSelectors(this.selectors);
-                        return tryInteract(this.selectors, retryCount + 1);
-                    }
-                    console.log("⚠️ 無法修復按鈕，嘗試使用 Enter 鍵發送...");
-                    await this.page.keyboard.press('Enter');
-                } else {
-                    try {
-                        await this.page.waitForSelector(sel.send, { timeout: 2000 });
-                        await this.page.click(sel.send);
-                    } catch (e) { await this.page.keyboard.press('Enter'); }
-                }
-
-                if (isSystem) { await new Promise(r => setTimeout(r, 2000)); return ""; }
-
-                console.log(`⚡ [Brain] 等待信封完整性 (${TAG_START} ... ${TAG_END})...`);
-
-                const finalResponse = await this.page.evaluate(async (selector, startTag, endTag, oldText) => {
-                    return new Promise((resolve) => {
-                        const startTime = Date.now();
-                        let stableCount = 0;
-                        let lastCheckText = "";
-
-                        const check = () => {
-                            const bubbles = document.querySelectorAll(selector);
-                            if (bubbles.length === 0) { setTimeout(check, 500); return; }
-
-                            const currentLastBubble = bubbles[bubbles.length - 1];
-                            const rawText = currentLastBubble.innerText || "";
-
-                            const startIndex = rawText.indexOf(startTag);
-                            if (startIndex !== -1) {
-                                const endIndex = rawText.indexOf(endTag);
-                                if (endIndex !== -1 && endIndex > startIndex) {
-                                    const content = rawText.substring(startIndex + startTag.length, endIndex).trim();
-                                    resolve({ status: 'ENVELOPE_COMPLETE', text: content });
-                                    return;
-                                }
-                                if (rawText === lastCheckText && rawText.length > lastCheckText.length) {
-                                    stableCount = 0;
-                                } else if (rawText === lastCheckText) {
-                                    stableCount++;
-                                } else {
-                                    stableCount = 0;
-                                }
-                                lastCheckText = rawText;
-
-                                if (stableCount > 5) {
-                                    const content = rawText.substring(startIndex + startTag.length).trim();
-                                    resolve({ status: 'ENVELOPE_TRUNCATED', text: content });
-                                    return;
-                                }
-                            }
-                            else if (rawText !== oldText && !rawText.includes('SYSTEM: Please WRAP')) {
-                                if (rawText === lastCheckText && rawText.length > 5) stableCount++;
-                                else stableCount = 0;
-                                lastCheckText = rawText;
-                                if (stableCount > 5) { resolve({ status: 'FALLBACK_DIFF', text: rawText }); return; }
-                            }
-
-                            if (Date.now() - startTime > 90000) { resolve({ status: 'TIMEOUT', text: '' }); return; }
-                            setTimeout(check, 500);
-                        };
-                        check();
-                    });
-                }, sel.response, TAG_START, TAG_END, baseline);
-
-                if (finalResponse.status === 'TIMEOUT') throw new Error("等待回應超時");
-
-                console.log(`🏁 [Brain] 捕獲: ${finalResponse.status} | 長度: ${finalResponse.text.length}`);
-
-                let cleanText = finalResponse.text
-                    .replace(TAG_START, '')
-                    .replace(TAG_END, '')
-                    .replace(/\[SYSTEM: Please WRAP.*?\]/, '')
-                    .trim();
-
-                return cleanText;
-
-            } catch (e) {
-                console.warn(`⚠️ [Brain] 操作異常: ${e.message}`);
-                if (retryCount === 0) {
-                    console.log("🚑 [Brain] 呼叫 DOM Doctor 進行緊急手術 (Response)...");
-                    const htmlDump = await this.page.content();
-                    const newSelector = await this.doctor.diagnose(htmlDump, 'response');
-                    if (newSelector) {
-                        this.selectors.response = newSelector;
-                        this.doctor.saveSelectors(this.selectors);
-                        return await tryInteract(this.selectors, retryCount + 1);
-                    }
-                }
-                throw e;
-            }
-        };
-
-        return await tryInteract(this.selectors);
-    }
-}
 
 // ============================================================
 // ⚡ ResponseParser (JSON 解析器 - 寬鬆版 + 集中化)
 // ============================================================
-class ResponseParser {
-    static parse(raw) {
-        const parsed = { memory: null, actions: [], reply: "" };
-        const SECTION_REGEX = /(?:\s*\[\s*)?GOLEM_(MEMORY|ACTION|REPLY)(?:\s*\]\s*|:)?([\s\S]*?)(?=(?:\s*\[\s*)?GOLEM_(?:MEMORY|ACTION|REPLY)|$)/ig;
+// ResponseParser moved to brains/utils
 
-        let match;
-        let hasStructuredData = false;
-
-        while ((match = SECTION_REGEX.exec(raw)) !== null) {
-            hasStructuredData = true;
-            const type = match[1].toUpperCase();
-            const content = (match[2] || "").trim();
-
-            if (type === 'MEMORY') {
-                if (content && content !== 'null' && content !== '(無)') parsed.memory = content;
-            } else if (type === 'ACTION') {
-                const jsonCandidate = content.replace(/```json/g, '').replace(/```/g, '').trim();
-                if (jsonCandidate && jsonCandidate !== 'null') {
-                    try {
-                        const jsonObj = JSON.parse(jsonCandidate);
-                        const steps = Array.isArray(jsonObj) ? jsonObj : (jsonObj.steps || [jsonObj]);
-                        parsed.actions.push(...steps);
-                    } catch (e) {
-                        const fallbackMatch = jsonCandidate.match(/\[\s*\{[\s\S]*\}\s*\]/) || jsonCandidate.match(/\{[\s\S]*\}/);
-                        if (fallbackMatch) {
-                            try {
-                                const fixed = JSON.parse(fallbackMatch[0]);
-                                parsed.actions.push(...(Array.isArray(fixed) ? fixed : [fixed]));
-                            } catch (err) { }
-                        }
-                    }
-                }
-            } else if (type === 'REPLY') {
-                parsed.reply = content;
-            }
-        }
-
-        if (!hasStructuredData) parsed.reply = raw.replace(/GOLEM_\w+/g, '').trim();
-        return parsed;
-    }
-
-    static extractJson(text) {
-        if (!text) return [];
-        try {
-            const match = text.match(/```json([\s\S]*?)```/);
-            if (match) return JSON.parse(match[1]).steps || JSON.parse(match[1]);
-            const arrayMatch = text.match(/\[\s*\{[\s\S]*\}\s*\]/);
-            if (arrayMatch) return JSON.parse(arrayMatch[0]);
-        } catch (e) { console.error("解析 JSON 失敗:", e.message); }
-        return [];
-    }
-}
 
 // ============================================================
 // 🧬 NeuroShunter (神經分流中樞 - 核心邏輯層)
@@ -1380,18 +861,44 @@ class AutonomyManager {
 // ============================================================
 // 🎮 Hydra Main Loop
 // ============================================================
-const brain = new GolemBrain();
+// --- Brain Initialization ---
+// Memory Driver Selection
+const mode = cleanEnv(process.env.GOLEM_MEMORY_MODE || 'browser').toLowerCase();
+console.log(`⚙️ [System] Memory Mode: ${mode.toUpperCase()}`);
+let memoryDriver;
+if (mode === 'qmd') memoryDriver = new SystemQmdDriver(CONFIG);
+else if (mode === 'native' || mode === 'system') memoryDriver = new SystemNativeDriver();
+else memoryDriver = new BrowserMemoryDriver(CONFIG);
+
+const brain = new BrainManager(CONFIG, memoryDriver);
+
+// Register Brains based on Sequence
+if (CONFIG.BRAIN_SEQUENCE.length === 0) {
+    console.warn("⚠️ No BRAIN_SEQUENCE defined. Defaulting to Gemini Web.");
+    brain.addBrain(new WebGeminiBrain(CONFIG, memoryDriver));
+} else {
+    for (const type of CONFIG.BRAIN_SEQUENCE) {
+        const t = type.trim().toLowerCase();
+        console.log(`🧠 Registering Brain: ${t}`);
+        if (t === 'gemini-web') brain.addBrain(new WebGeminiBrain(CONFIG, memoryDriver));
+        else if (t === 'chatgpt-web') brain.addBrain(new WebChatGPTBrain(CONFIG, memoryDriver));
+        else if (t === 'ollama') brain.addBrain(new OllamaBrain(CONFIG, memoryDriver));
+    }
+}
+
 const controller = new TaskController();
 const autonomy = new AutonomyManager(brain);
-
-// ✨ [Titan Queue] 初始化隊列管理器
 const convoManager = new ConversationManager(brain, NeuroShunter, controller);
 
 (async () => {
     if (process.env.GOLEM_TEST_MODE === 'true') { console.log('🚧 GOLEM_TEST_MODE active.'); return; }
+
+    // Init Memory Driver first
+    if (memoryDriver.init) await memoryDriver.init();
+
     await brain.init();
     autonomy.start();
-    console.log('📡 Golem v8.6 (Titan Chronos Edition) is Online.');
+    console.log('📡 Golem v8.7 (Multi-Brain Architecture) is Online.');
     if (dcClient) dcClient.login(CONFIG.DC_TOKEN);
 })();
 

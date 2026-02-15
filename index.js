@@ -98,7 +98,24 @@ if (CONFIG.API_KEYS.some(isPlaceholder)) CONFIG.API_KEYS = CONFIG.API_KEYS.filte
 // puppeteer.use(StealthPlugin()); // Moved to Brains
 
 
-const tgBot = CONFIG.TG_TOKEN ? new TelegramBot(CONFIG.TG_TOKEN, { polling: true }) : null;
+const tgBot = CONFIG.TG_TOKEN ? new TelegramBot(CONFIG.TG_TOKEN, {
+    polling: true,
+    request: {
+        agentOptions: {
+            keepAlive: true,
+            family: 4
+        }
+    }
+}) : null;
+
+if (tgBot) {
+    tgBot.on('polling_error', (error) => {
+        // Suppress benign network errors
+        if (error.code === 'EFATAL' || error.message.includes('EFATAL')) return;
+        console.warn(`⚠️ [Telegram] Polling Error: ${error.code || error.message}`);
+    });
+}
+
 const dcClient = CONFIG.DC_TOKEN ? new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
     partials: [Partials.Channel]
@@ -604,6 +621,24 @@ class NodeRouter {
             });
             return true;
         }
+        if (text === '/models' || text === '/status') {
+            const list = brain.getBrainList();
+            const msg = "**🧠 Brain Status & Order:**\n" + list.map((b, i) =>
+                `${i + 1}. ${b.isPrimary ? '🌟 ' : ''}**${b.name}** (${b.ready ? '✅' : '❌'})`
+            ).join('\n') + "\n\nUse `/model <name>` to switch primary.";
+            await ctx.reply(msg);
+            return true;
+        }
+        if (text.startsWith('/model ')) {
+            const target = text.replace('/model ', '').trim();
+            if (brain.setPrimaryBrain(target)) {
+                const list = brain.getBrainList();
+                await ctx.reply(`✅ **Switched Primary Brain to: ${list[0].name}**\n\nNew Order:\n` + list.map(b => b.name).join(' -> '));
+            } else {
+                await ctx.reply(`❌ Brain not found: "${target}".\nAvailable: ${brain.brains.map(b => b.name).join(', ')}`);
+            }
+            return true;
+        }
         if (text.startsWith('/callme')) {
             const newName = text.replace('/callme', '').trim();
             if (newName) {
@@ -880,9 +915,17 @@ if (CONFIG.BRAIN_SEQUENCE.length === 0) {
     for (const type of CONFIG.BRAIN_SEQUENCE) {
         const t = type.trim().toLowerCase();
         console.log(`🧠 Registering Brain: ${t}`);
-        if (t === 'gemini-web') brain.addBrain(new WebGeminiBrain(CONFIG, memoryDriver));
-        else if (t === 'chatgpt-web') brain.addBrain(new WebChatGPTBrain(CONFIG, memoryDriver));
-        else if (t === 'ollama') brain.addBrain(new OllamaBrain(CONFIG, memoryDriver));
+
+        // Support both old (gemini-web) and new (web/gemini) formats for backward compat
+        if (t === 'web/gemini' || t === 'gemini-web') {
+            brain.addBrain(new WebGeminiBrain(CONFIG, memoryDriver));
+        }
+        else if (t === 'web/chatgpt' || t === 'chatgpt-web') {
+            brain.addBrain(new WebChatGPTBrain(CONFIG, memoryDriver));
+        }
+        else if (t === 'ollama' || t.startsWith('ollama/')) {
+            brain.addBrain(new OllamaBrain(CONFIG, memoryDriver));
+        }
     }
 }
 
@@ -904,8 +947,14 @@ const convoManager = new ConversationManager(brain, NeuroShunter, controller);
 
 // --- 統一事件處理 (已更新為 Queue 模式) ---
 async function handleUnifiedMessage(ctx) {
+    console.log(`📩 [Debug] Received message from ${ctx.platform}: ${ctx.userId} | Text: ${ctx.text}`);
     if (!ctx.text && !ctx.getAttachment()) return;
-    if (!ctx.isAdmin) return;
+
+    if (!ctx.isAdmin) {
+        console.log(`⛔ [Debug] Access Denied. User ${ctx.userId} is not in ADMIN_IDS: ${CONFIG.ADMIN_IDS.join(', ')}`);
+        return;
+    }
+
     if (await NodeRouter.handle(ctx, brain)) return;
     if (global.pendingPatch && ['ok', 'deploy', 'y', '部署'].includes(ctx.text.toLowerCase())) return executeDeploy(ctx);
     if (global.pendingPatch && ['no', 'drop', 'n', '丟棄'].includes(ctx.text.toLowerCase())) return executeDrop(ctx);

@@ -86,25 +86,26 @@ class BrowserMemoryDriver {
         this.browser = null;
         this.memoryPage = null;
     }
-    async init() {
-        if (this.memoryPage) return;
-        try {
-            // Launch a dedicated lightweight browser for memory if needed
-            // Or try to attach to an existing one? Hard to attach without port.
-            // We'll launch a new one. Minimal resources.
-            this.browser = await puppeteer.launch({
-                headless: "new",
-                userDataDir: this.config.USER_DATA_DIR, // Share User Data
-                args: ['--no-sandbox', '--window-size=100,100'] // Minimal size
-            });
 
+    async init() {
+        // Do nothing here for Browser mode. We wait for shared browser.
+        console.log(`🧠 [Memory:Browser] Standing by for Shared Browser...`);
+    }
+
+    async setSharedBrowser(browser) {
+        if (this.memoryPage) return;
+        this.browser = browser;
+        try {
+            console.log(`🧠 [Memory:Browser] Connecting to Shared Browser...`);
             this.memoryPage = await this.browser.newPage();
             const memoryPath = 'file:///' + path.join(process.cwd(), 'memory.html').replace(/\\/g, '/');
             console.log(`🧠 [Memory:Browser] Mounting Hippocampus: ${memoryPath}`);
             await this.memoryPage.goto(memoryPath);
-            await new Promise(r => setTimeout(r, 2000));
-        } catch (e) { console.error("❌ [Memory:Browser] Failed:", e.message); }
+        } catch (e) {
+            console.error("❌ [Memory:Browser] Failed to attach:", e.message);
+        }
     }
+
     async recall(query) {
         if (!this.memoryPage) return [];
         return await this.memoryPage.evaluate(async (txt) => {

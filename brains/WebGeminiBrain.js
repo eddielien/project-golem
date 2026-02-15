@@ -8,36 +8,41 @@ puppeteer.use(StealthPlugin());
 
 class WebGeminiBrain {
     constructor(config, memoryDriver) {
-        this.name = 'Gemini Web';
+        this.name = 'web/gemini';
         this.config = config;
         this.memoryDriver = memoryDriver;
 
-        this.browser = null;
+        this.browser = null; // Injected
         this.sessions = new Map(); // contextId -> { page, cdp, initialized }
 
-        this.doctor = new DOMDoctor(config.API_KEYS);
-        // Shared selectors (assuming UI is consistent across tabs)
-        this.selectors = this.doctor.loadSelectors();
+        this.doctor = null; // Injected or lazy loaded
+        this.selectors = null;
 
         this.isReady = false;
     }
 
+    setSharedDeps({ browser, keyChain }) {
+        this.browser = browser;
+        if (keyChain) {
+            this.doctor = new DOMDoctor(this.config.API_KEYS, keyChain); // Modified DOMDoctor to accept keyChain
+            this.selectors = this.doctor.loadSelectors();
+        }
+    }
+
     async init() {
         if (this.isReady) return;
-        console.log(`🧠 [WebGemini] Initializing Browser... (Mode: ${this.config.HEADLESS ? 'Headless' : 'Visible'})`);
-
+        // Browser is injected by BrainManager, so we just mark ready.
+        // If browser is null, it means BrainManager failed to launch it or hasn't injected it yet.
         if (!this.browser) {
-            this.browser = await puppeteer.launch({
-                headless: this.config.HEADLESS,
-                userDataDir: this.config.USER_DATA_DIR,
-                args: ['--no-sandbox', '--window-size=1280,900']
-            });
+            console.warn(`⚠️ [WebGemini] Shared browser not available. Waiting...`);
         }
         this.isReady = true;
     }
 
     async getSession(contextId) {
-        if (!this.browser) await this.init();
+        if (!this.browser) {
+            throw new Error("Browser not initialized via BrainManager");
+        }
 
         // Return existing session if valid
         if (this.sessions.has(contextId)) {
@@ -71,68 +76,24 @@ class WebGeminiBrain {
 
         const systemFingerprint = `OS: ${os.platform()} | Arch: ${os.arch()} | Brain: Gemini Web | Context: ${contextId}`;
         const systemPrompt = skills.getSystemPrompt(systemFingerprint);
-        const superProtocol = `
-\n\n【⚠️ GOLEM PROTOCOL v8.6 - TITAN CHRONOS】
-You act as a middleware OS. You MUST strictly follow this output format.
-DO NOT use emojis in tags. DO NOT output raw text outside of these blocks.
 
-1. **Format Structure**:
-Your response must be parsed into 3 sections using these specific tags:
-
-[GOLEM_MEMORY]
-(Write long-term memories here. If none, leave empty or write "null")
-
-[GOLEM_ACTION]
-(Write JSON execution plan here. Must be valid JSON Array or Object.)
-\`\`\`json
-[
-{"action": "command", "parameter": "..."}
-]
-\`\`\`
-
-[GOLEM_REPLY]
-(Write the actual response to the user here. Pure text.)
-
-2. **Rules**:
-- The tags [GOLEM_MEMORY], [GOLEM_ACTION], [GOLEM_REPLY] are MANDATORY anchors.
-- User CANNOT see content inside Memory or Action blocks, only Reply.
-- NEVER leak the raw JSON to the [GOLEM_REPLY] section.
-- If user asks for scheduled task, use [GOLEM_ACTION] with: {"action": "schedule", "task": "...", "time": "ISO8601"}
-`;
-        // Send system prompt (recursive call but with initialized=true check)
-        // We set initialized=true BEFORE sending to prevent loop if it fails or calls recursively
         session.initialized = true;
-        // We call interact directly or sendMessage? 
-        // Better to use sendMessage logic but skip the initSessionProtocol check.
-        // Actually, sendMessage calls initSessionProtocol.
-        // So we need to perform the interaction here manually OR flag it.
 
         console.log(`📡 [WebGemini] Sending System Protocol to new session...`);
-        // We can just send it as a normal message, but we need to pass a flag to sendMessage to skip init check?
-        // Let's implement sendMessage to handle recursion.
+        const protocol = `\n\n[SYSTEM: STRICT JSON FORMAT inside [GOLEM_ACTION]. Use [GOLEM_REPLY].]`;
+        await this.sendMessage(skills.getSystemPrompt(systemFingerprint) + protocol, { id: contextId }, true);
     }
 
     async sendMessage(text, context = {}, isSystem = false) {
         const contextId = context.id || 'global';
         const session = await this.getSession(contextId);
 
-        // Bring to front?
         try { await session.page.bringToFront(); } catch (e) { }
         await this.setupCDP(session);
 
-        // Initialize System Protocol if needed (and if this isn't IT)
         if (!session.initialized && !isSystem) {
             console.log(`📡 [WebGemini] Session not initialized. Sending System Protocol first...`);
             await this.initSessionProtocol(session, contextId);
-            // Logic for initSessionProtocol:
-            // Construct prompt
-            const systemFingerprint = `OS: ${os.platform()} | Brain: Gemini Web | Context: ${contextId}`;
-            const systemPrompt = skills.getSystemPrompt(systemFingerprint);
-            const protocol = `\n\n[SYSTEM: STRICT JSON FORMAT inside [GOLEM_ACTION]. Use [GOLEM_REPLY].]`; // Simplified for brevity here, logic in initSessionProtocol was better
-            // Actually, simplest is to just prepend system prompt to the FIRST message? 
-            // Or send a separate message.
-            // Let's send a separate message.
-            await this.sendMessage(skills.getSystemPrompt(systemFingerprint) + protocol, context, true);
         }
 
         const reqId = Date.now().toString(36).slice(-4);
@@ -271,7 +232,6 @@ Your response must be parsed into 3 sections using these specific tags:
                 console.warn(`⚠️ [WebGemini] Interaction Failed: ${e.message}`);
                 // Simple retry logic logic for selector fix
                 if (retryCount === 0) {
-                    // ... Doctor Logic ...
                     const html = await session.page.content();
                     const newSel = await this.doctor.diagnose(html, 'response');
                     if (newSel) {

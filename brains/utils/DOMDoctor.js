@@ -17,8 +17,12 @@ class KeyChain {
 }
 
 class DOMDoctor {
-    constructor(apiKeys) {
-        this.keyChain = new KeyChain(apiKeys);
+    constructor(apiKeys, existingKeyChain) {
+        if (existingKeyChain) {
+            this.keyChain = existingKeyChain;
+        } else {
+            this.keyChain = new KeyChain(apiKeys);
+        }
         this.cacheFile = path.join(process.cwd(), 'golem_selectors.json');
         this.defaults = {
             input: 'div[contenteditable="true"], rich-textarea > div, p[data-placeholder]',

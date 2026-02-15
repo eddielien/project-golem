@@ -7,11 +7,11 @@ const skills = require('../skills');
 
 class OllamaBrain {
     constructor(config, memoryDriver) {
-        this.name = 'Ollama Local';
         this.config = config; // { OLLAMA_BASE_URL, OLLAMA_MODEL ... }
         this.memoryDriver = memoryDriver;
         this.baseUrl = config.OLLAMA_BASE_URL || 'http://localhost:11434';
         this.model = config.OLLAMA_MODEL || 'llama3';
+        this.name = `ollama/${this.model}`;
 
         // Context ID -> History Array
         this.histories = new Map();
@@ -20,15 +20,24 @@ class OllamaBrain {
     }
 
     async init() {
-        console.log(`🧠 [Ollama] Initialized. Target: ${this.baseUrl} | Model: ${this.model}`);
+        console.log(`🧠 [Ollama] Initializing. Target: ${this.baseUrl} | Model: ${this.model}`);
         // Optional: Check connection
         try {
-            const res = await fetch(`${this.baseUrl}/api/tags`);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
+            const res = await fetch(`${this.baseUrl}/api/tags`, { signal: controller.signal });
+            clearTimeout(timeoutId);
+
             if (res.ok) console.log("✅ [Ollama] Service is reachable.");
-            else console.warn("⚠️ [Ollama] Service might be down.");
+            else console.warn("⚠️ [Ollama] Service unreachable (Status: " + res.status + ")");
         } catch (e) {
-            console.warn(`⚠️ [Ollama] Connection failed: ${e.message}`);
+            console.warn(`⚠️ [Ollama] Connection failed (Is Ollama running?): ${e.message}`);
+            // Do not throw; allow app to start without Ollama
         }
+    }
+
+    setSharedDeps(deps) {
+        // Ollama doesn't need browser, but we provide method to conform to interface
     }
 
     async sendMessage(text, context = {}, isSystem = false) {
@@ -59,7 +68,10 @@ class OllamaBrain {
                 body: JSON.stringify({
                     model: this.model,
                     messages: history,
-                    stream: false
+                    stream: false,
+                    options: {
+                        num_ctx: 16384 // Increase context window for large prompts
+                    }
                 })
             });
 

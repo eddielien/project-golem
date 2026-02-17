@@ -76,35 +76,18 @@ class WebChatGPTBrain {
 
         try { await page.bringToFront(); } catch (e) { }
 
-        // Initialize System Prompt for new sessions
+        // Initialize System Prompt for new sessions (single message, no chunking)
         if (!session.initialized && !isSystem) {
             session.initialized = true;
             const systemFingerprint = `OS: ${os.platform()} | Brain: ChatGPT Web | Context: ${safeContextId}`;
             const fullPrompt = skills.getSystemPrompt(systemFingerprint);
-            const superProtocol = `\n\n[SYSTEM: You are Golem. STRICTLY output in [GOLEM_MEMORY], [GOLEM_ACTION], [GOLEM_REPLY] format.]`;
+            const superProtocol = ` [SYSTEM: You are Golem. STRICTLY output in [GOLEM_MEMORY], [GOLEM_ACTION], [GOLEM_REPLY] format.]`;
 
-            // Chunking Logic (v2 - with logging)
-            const totalText = fullPrompt + superProtocol;
-            const chunkSize = 2000; // Conservative chunk size
-            const chunks = [];
-            for (let i = 0; i < totalText.length; i += chunkSize) {
-                chunks.push(totalText.slice(i, i + chunkSize));
-            }
+            // Strip newlines to avoid keyboard.type sending prematurely via Enter
+            const cleanPrompt = (fullPrompt + superProtocol).replace(/\n+/g, ' ').replace(/\s{2,}/g, ' ');
 
-            console.log(`📡 [WebChatGPT] Sending System Prompt in ${chunks.length} chunks...`);
-
-            for (let i = 0; i < chunks.length; i++) {
-                const isLast = i === chunks.length - 1;
-                const header = `[SYSTEM PART ${i + 1}/${chunks.length}]`;
-                const footer = isLast ? "[SYSTEM INIT COMPLETE]" : "[WAIT FOR NEXT PART]";
-                const chunkPayload = `${header}\n${chunks[i]}\n${footer}`;
-
-                console.log(`📤 [WebChatGPT] Sending Chunk ${i + 1}/${chunks.length} (${chunkPayload.length} chars)`);
-                await this.sendMessage(chunkPayload, { ...context, id: safeContextId }, true);
-
-                // Wait for ChatGPT to process/index
-                await new Promise(r => setTimeout(r, 3000));
-            }
+            console.log(`📡 [WebChatGPT] Sending System Prompt (${cleanPrompt.length} chars, single message)...`);
+            await this.sendMessage(cleanPrompt, { ...context, id: safeContextId }, true);
         }
 
         const reqId = Date.now().toString(36).slice(-4);

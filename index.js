@@ -36,6 +36,15 @@ if (process.argv.includes('dashboard')) {
     console.log("ℹ️  以標準模式啟動 (無 Dashboard)。若需介面請輸入 'npm start dashboard'");
 }
 
+
+// 🛡️ Global Crash Prevention
+process.on('uncaughtException', (err) => {
+    console.error('🛡️ [Global] Uncaught Exception (prevented crash):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('🛡️ [Global] Unhandled Rejection (prevented crash):', reason?.message || reason);
+});
+
 // ==========================================
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
@@ -143,12 +152,14 @@ class OpticNerve {
         console.log(`👁️ [OpticNerve] 正在透過 Gemini 2.5 Flash 分析檔案 (${mimeType})...`);
         try {
             const buffer = await new Promise((resolve, reject) => {
-                https.get(fileUrl, (res) => {
+                const req = https.get(fileUrl, (res) => {
                     const data = [];
                     res.on('data', (chunk) => data.push(chunk));
                     res.on('end', () => resolve(Buffer.concat(data)));
                     res.on('error', reject);
                 });
+                req.on('error', reject); // Handle request-level errors (ETIMEDOUT, etc.)
+                req.setTimeout(15000, () => { req.destroy(new Error('Download timeout')); });
             });
             const genAI = new GoogleGenerativeAI(apiKey);
             const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
@@ -975,7 +986,7 @@ async function handleUnifiedMessage(ctx) {
         // 圖片分析
         if (attachment) {
             await ctx.reply("👁️ 正在透過 OpticNerve 分析檔案...");
-            const apiKey = brain.doctor.keyChain.getKey();
+            const apiKey = brain.keyChain ? brain.keyChain.getKey() : null;
             if (apiKey) {
                 const analysis = await OpticNerve.analyze(attachment.url, attachment.mimeType, apiKey);
                 finalInput = `【系統通知：視覺訊號】\n檔案類型：${attachment.mimeType}\n分析報告：\n${analysis}\n使用者訊息：${ctx.text || ""}\n請根據分析報告回應。`;
@@ -987,7 +998,7 @@ async function handleUnifiedMessage(ctx) {
         // ✨ [Titan Queue] 交給隊列，不再直接 sendMessage
         await convoManager.enqueue(ctx, finalInput);
 
-    } catch (e) { console.error(e); await ctx.reply(`❌ 錯誤: ${e.message}`); }
+    } catch (e) { console.error(e); try { await ctx.reply(`❌ 錯誤: ${e.message}`); } catch (_) { } }
 }
 
 async function handleUnifiedCallback(ctx, actionData) {
